@@ -4,14 +4,17 @@
 #include <moveit/task_constructor/task.h>
 #include <moveit/task_constructor/stages.h>
 #include <moveit/task_constructor/solvers.h>
+#include <moveit/task_constructor/storage.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.hpp>
 #include <moveit_msgs/msg/collision_object.hpp>
+#include <moveit_msgs/msg/move_it_error_codes.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+
 
 // ── Namespaces ──────────────────────────────────────────────────────────────
 namespace mtc = moveit::task_constructor;
@@ -58,6 +61,8 @@ void spawnScene(rclcpp::Node::SharedPtr node)
   psi.applyCollisionObjects({obj});
   RCLCPP_INFO(node->get_logger(), "Scene spawned: %s", OBJECT_ID.c_str());
 }
+
+
 
 // ── Build MTC Task ───────────────────────────────────────────────────────────
 mtc::Task buildTask(rclcpp::Node::SharedPtr node)
@@ -413,22 +418,27 @@ int main(int argc, char** argv)
     executor.cancel();
     spin_thread.join();
     rclcpp::shutdown();
-    return 1;
+    return 1;8
   }
 
   RCLCPP_INFO(node->get_logger(), "Planning succeeded! Publishing solution for RViz...");
   task.introspection().publishSolution(*task.solutions().front());
+  RCLCPP_INFO(node->get_logger(), "Solution published to RViz.");
 
-  // Uncomment to actually execute on the robot/simulation from code:
-  // auto result = task.execute(*task.solutions().front());
-  // if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
-  //   RCLCPP_ERROR(node->get_logger(), "Execution failed");
-  // } else {
-  //   RCLCPP_INFO(node->get_logger(), "Execution completed successfully!");
-  // }
+  // Give controllers a moment to settle before executing
+  rclcpp::sleep_for(std::chrono::seconds(2));
 
-  RCLCPP_INFO(node->get_logger(), "Node kept alive for RViz visualization. Press Ctrl+C to exit.");
-  
+  // ── Execute via MoveIt's ExecuteTaskSolution action (through move_group) ──
+  RCLCPP_INFO(node->get_logger(), "Executing solution via MoveIt...");
+  auto result = task.execute(*task.solutions().front());
+  if (result.val == moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
+    RCLCPP_INFO(node->get_logger(), "Execution succeeded!");
+  } else {
+    RCLCPP_ERROR(node->get_logger(), "Execution failed (MoveIt error code: %d)", result.val);
+  }
+
+  RCLCPP_INFO(node->get_logger(), "Press Ctrl+C to exit the node.");
+
   spin_thread.join();
   rclcpp::shutdown();
   return 0;

@@ -21,3 +21,4 @@ moveit_simple_controller_manager:
     action_ns: gripper_cmd
     joints:
       - gripper_left_joint
+      - gripper_right_joint
