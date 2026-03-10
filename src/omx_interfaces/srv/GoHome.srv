@@ -1,0 +1,6 @@
+# Go to a named arm state (e.g. "home", "init").
+
+string state_name
+---
+bool success
+string message

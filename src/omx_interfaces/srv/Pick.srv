@@ -1,0 +1,7 @@
+# Pick an object by its collision-object ID.
+# The object must already exist in the MoveIt planning scene.
+
+string object_id
+---
+bool success
+string message

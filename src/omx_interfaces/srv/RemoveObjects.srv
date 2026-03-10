@@ -1,0 +1,8 @@
+# Remove specific objects by ID, or clear all managed objects.
+# If clear_all is true, object_ids is ignored.
+
+bool clear_all
+string[] object_ids
+---
+bool success
+string message

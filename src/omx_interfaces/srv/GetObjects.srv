@@ -1,0 +1,6 @@
+# Get all managed object IDs and their poses.
+
+---
+string[] object_ids
+geometry_msgs/PoseStamped[] poses
+string[] object_types

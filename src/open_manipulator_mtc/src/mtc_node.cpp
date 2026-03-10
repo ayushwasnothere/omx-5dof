@@ -418,7 +418,7 @@ int main(int argc, char** argv)
     executor.cancel();
     spin_thread.join();
     rclcpp::shutdown();
-    return 1;8
+    return 1;
   }
 
   RCLCPP_INFO(node->get_logger(), "Planning succeeded! Publishing solution for RViz...");

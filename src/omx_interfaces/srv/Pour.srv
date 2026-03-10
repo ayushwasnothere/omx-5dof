@@ -1,0 +1,8 @@
+# Pour the contents of the currently held object into target_object_id.
+# The robot moves above the target, then tilts the wrist to pour.
+
+string target_object_id
+float64 pour_angle          # radians to tilt (default ~2.0 rad ≈ 115°)
+---
+bool success
+string message

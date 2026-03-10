@@ -1,0 +1,9 @@
+# Rotate (mix) using the wrist roll joint.
+# angle: total rotation in radians (positive = one direction)
+# cycles: number of back-and-forth oscillations (0 = single rotation)
+
+float64 angle               # radians (default ~3.14)
+int32 cycles                # 0 = single rotation, >0 = oscillate N times
+---
+bool success
+string message

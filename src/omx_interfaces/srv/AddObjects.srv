@@ -1,0 +1,6 @@
+# Add one or more collision objects to the planning scene.
+
+omx_interfaces/SceneObject[] objects
+---
+bool success
+string message
