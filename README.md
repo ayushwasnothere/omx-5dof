@@ -126,7 +126,7 @@ ros2 service call /manipulator_node/rotate omx_interfaces/srv/Rotate \
 
 Pick an object first, then pour into another:
 
-```bash
+` +[[]]``bash
 ros2 service call /manipulator_node/pick omx_interfaces/srv/Pick "{object_id: 'cup1'}"
 ros2 service call /manipulator_node/pour omx_interfaces/srv/Pour \
   "{target_object_id: 'bowl1', pour_angle: 2.0}"
@@ -149,8 +149,7 @@ ros2 service call /manipulator_node/go_home omx_interfaces/srv/GoHome "{state_na
 Remove specific objects:
 
 ```bash
-ros2 service call /manipulator_node/remove_objects omx_interfaces/srv/RemoveObjects \
-  "{clear_all: false, object_ids: ['cup1']}"
+ 
 ```
 
 Clear all:
@@ -391,8 +390,8 @@ Set `use_camera_frame: true` on the object — the manipulator node transforms t
 ros2 service call /manipulator_node/add_objects omx_interfaces/srv/AddObjects \
   "{objects: [
     {id: 'cam_cup1', type: 'cylinder', use_camera_frame: true,
-     pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.5}, orientation: {w: 1.0}}},
-     dimensions: [0.08, 0.015]}
+     pose: {pose: {position: {x: -0.0720, y: 0.25, z: 0.557}, orientation: {w: 1.0}}},
+     dimensions: [0.2, 0.025]}
   ]}"
 ```
 
@@ -415,3 +414,4 @@ redis-cli XADD robot.tasks '*' task_id cam-place-001 skill place params \
 ```
 
 **Robot frame (default):** When `use_camera_frame` is `false` (or omitted), coordinates are in the robot/world frame as before.
+

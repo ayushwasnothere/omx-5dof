@@ -160,19 +160,6 @@ private:
     return 0.0;
   }
 
-  // Extract grip width (diameter) from tracked object dimensions
-  //   Cylinder: dims = [height, radius] → width = 2*radius
-  //   Box:      dims = [dx, dy, dz]     → width = min(dx, dy)
-  //   Sphere:   dims = [radius]          → width = 2*radius
-  static double objectWidth(const TrackedObject& obj)
-  {
-    const auto& d = obj.dimensions;
-    if (obj.type == "cylinder" && d.size() >= 2) return 2.0 * d[1];
-    if (obj.type == "box"      && d.size() >= 2) return std::min(d[0], d[1]);
-    if (obj.type == "sphere"   && d.size() >= 1) return 2.0 * d[0];
-    return 0.0;
-  }
-
   // ── Service handles ─────────────────────────────────────────────────────
   rclcpp::Service<omx_interfaces::srv::Pick>::SharedPtr pick_srv_;
   rclcpp::Service<omx_interfaces::srv::Place>::SharedPtr place_srv_;
@@ -251,10 +238,7 @@ private:
     }
 
     if (!task.plan(max_plans)) {
-      // Collect per-stage failure details
-      std::ostringstream details;
-      task.explainFailure(details);
-      err_msg = "Planning failed:\n" + details.str();
+      err_msg = "Planning failed";
       RCLCPP_ERROR(get_logger(), "%s", err_msg.c_str());
       return false;
     }
@@ -277,7 +261,7 @@ private:
   {
     double yaw = std::atan2(y, x);
     tf2::Quaternion q;
-    q.setRPY(0.0, 0.15, yaw);  // slight pitch for stable grasp
+    q.setRPY(0.0, 0.0, yaw);  // horizontal gripper, pointing toward object
     return tf2::toMsg(q);
   }
 
@@ -296,10 +280,7 @@ private:
       return;
     }
 
-    // Look up object pose and dimensions from tracker
-    geometry_msgs::msg::PoseStamped obj_pose;
-    double obj_height = 0.0;
-    double obj_width  = 0.0;
+    // Look up object (verify it exists)
     {
       std::lock_guard<std::mutex> sl(scene_mutex_);
       auto it = tracked_objects_.find(req->object_id);
@@ -308,18 +289,7 @@ private:
         res->message = "Object '" + req->object_id + "' not found in scene.";
         return;
       }
-      obj_pose = it->second.pose;
-      obj_height = objectHeight(it->second);
-      obj_width  = objectWidth(it->second);
     }
-
-    double ox = obj_pose.pose.position.x;
-    double oy = obj_pose.pose.position.y;
-    // Grasp at the object centroid — gives maximum grip contact and keeps
-    // the place height consistent (no gripper-to-center offset to manage)
-    double oz = obj_pose.pose.position.z;
-    RCLCPP_INFO(get_logger(), "Grasp at centroid: center_z=%.3f, obj_height=%.3f",
-                oz, obj_height);
 
     // Build pick task
     auto pipeline = makePipeline();
@@ -352,28 +322,18 @@ private:
       task.add(std::move(s));
     }
 
-    // Pick container
+    // Pick container (following reference: automaticaddison.com MTC pick-place)
     {
       auto pick = std::make_unique<mtc::SerialContainer>("pick object");
       task.properties().exposeTo(pick->properties(), {"eef", "hand", "group", "ik_frame"});
       pick->properties().configureInitFrom(mtc::Stage::PARENT,
                                             {"eef", "hand", "group", "ik_frame"});
 
-      // Zero wrist roll before approach so object stays vertical
+      // Approach object — Cartesian straight-line descent along world Z
       {
-        auto s = std::make_unique<mtc::stages::MoveTo>("zero wrist roll", joint_interp_);
-        s->setGroup(ARM_GROUP);
-        std::map<std::string, double> joints;
-        joints["joint5_roll"] = 0.0;
-        s->setGoal(joints);
-        pick->insert(std::move(s));
-      }
-
-      // Approach
-      {
-        auto s = std::make_unique<mtc::stages::MoveRelative>("approach object", joint_interp_);
-        s->setGroup(ARM_GROUP);
-        s->setMinMaxDistance(0.005, 0.10);
+        auto s = std::make_unique<mtc::stages::MoveRelative>("approach object", cartesian_);
+        s->properties().configureInitFrom(mtc::Stage::PARENT, {"group"});
+        s->setMinMaxDistance(0.05, 0.15);
         s->setIKFrame(HAND_FRAME);
         geometry_msgs::msg::Vector3Stamped dir;
         dir.header.frame_id = BASE_FRAME;
@@ -382,67 +342,54 @@ private:
         pick->insert(std::move(s));
       }
 
-      // Grasp pose
+      // Generate grasp pose — sample orientations around the object's Z-axis
+      // so MTC can find an IK solution with a clean vertical approach
       {
-        auto gen = std::make_unique<mtc::stages::GeneratePose>("generate grasp pose");
-        geometry_msgs::msg::PoseStamped grasp_pose;
-        grasp_pose.header.frame_id = BASE_FRAME;
-        grasp_pose.pose.position.x = ox;
-        grasp_pose.pose.position.y = oy;
-        grasp_pose.pose.position.z = oz;
-        grasp_pose.pose.orientation = graspOrientation(ox, oy);
-        gen->setPose(grasp_pose);
+        auto gen = std::make_unique<mtc::stages::GenerateGraspPose>("generate grasp pose");
+        gen->properties().configureInitFrom(mtc::Stage::PARENT);
+        gen->setPreGraspPose(GRIPPER_OPEN);
+        gen->setObject(req->object_id);
+        gen->setAngleDelta(M_PI / 12);  // 15° increments → 24 samples
         gen->setMonitoredStage(current_state_ptr);
 
         auto ik = std::make_unique<mtc::stages::ComputeIK>("grasp IK", std::move(gen));
         ik->setMaxIKSolutions(20);
-        ik->setTimeout(0.5);
+        ik->setMinSolutionDistance(0.5);
         ik->setIKFrame(HAND_FRAME);
         ik->properties().configureInitFrom(mtc::Stage::PARENT, {"eef", "group"});
         ik->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_pose"});
         pick->insert(std::move(ik));
       }
 
-      // Allow collision
+      // Allow collision (gripper ↔ object)
       {
-        auto s = std::make_unique<mtc::stages::ModifyPlanningScene>("allow collision");
+        auto s = std::make_unique<mtc::stages::ModifyPlanningScene>("allow collision (gripper,object)");
         s->allowCollisions(req->object_id,
           task.getRobotModel()->getJointModelGroup(GRIPPER_GROUP)
             ->getLinkModelNamesWithCollisionGeometry(), true);
         pick->insert(std::move(s));
       }
 
-      // Close gripper to object width + 5% extra squeeze
+      // Close gripper
       {
         auto s = std::make_unique<mtc::stages::MoveTo>("close gripper", joint_interp_);
         s->setGroup(GRIPPER_GROUP);
-        // Gripper gap = 0.042 + 2*joint_val  →  joint_val = (gap - 0.042)/2
-        // Target gap = object_width * 0.95 (5% tighter for sturdy grip)
-        double target_gap = obj_width * 0.95;
-        double grip_joint = (target_gap - 0.042) / 2.0;
-        // Clamp to joint limits [-0.011, 0.02]
-        grip_joint = std::clamp(grip_joint, -0.011, 0.02);
-        RCLCPP_INFO(get_logger(),
-          "Gripper: obj_width=%.4f target_gap=%.4f joint=%.4f",
-          obj_width, target_gap, grip_joint);
-        std::map<std::string, double> grip_goal;
-        grip_goal["gripper_left_joint"] = grip_joint;
-        s->setGoal(grip_goal);
+        s->setGoal(GRIPPER_CLOSE);
         pick->insert(std::move(s));
       }
 
-      // Attach object
+      // Attach object to gripper
       {
         auto s = std::make_unique<mtc::stages::ModifyPlanningScene>("attach object");
         s->attachObject(req->object_id, EEF_LINK);
         pick->insert(std::move(s));
       }
 
-      // Lift
+      // Lift object — Cartesian straight-line ascent
       {
-        auto s = std::make_unique<mtc::stages::MoveRelative>("lift object", joint_interp_);
-        s->setGroup(ARM_GROUP);
-        s->setMinMaxDistance(0.005, 0.10);
+        auto s = std::make_unique<mtc::stages::MoveRelative>("lift object", cartesian_);
+        s->properties().configureInitFrom(mtc::Stage::PARENT, {"group"});
+        s->setMinMaxDistance(0.05, 0.15);
         s->setIKFrame(HAND_FRAME);
         geometry_msgs::msg::Vector3Stamped dir;
         dir.header.frame_id = BASE_FRAME;
@@ -482,23 +429,15 @@ private:
 
     const std::string obj_id = attached_object_id_;
 
-    // Retrieve object height for place Z computation
-    double half_h = 0.0;
-    {
-      std::lock_guard<std::mutex> sl(scene_mutex_);
-      auto it = tracked_objects_.find(obj_id);
-      if (it != tracked_objects_.end()) {
-        half_h = objectHeight(it->second) / 2.0;
-      }
-    }
-
     // Determine place pose
     geometry_msgs::msg::PoseStamped place_pose;
     if (req->use_target_pose) {
       place_pose = req->target_pose;
+      // If use_camera_frame flag is set, override frame_id to camera frame
       if (req->use_camera_frame) {
         place_pose.header.frame_id = CAMERA_FRAME;
       }
+      // Transform to world frame if needed
       std::string tf_err;
       if (!transformToWorld(place_pose, tf_err)) {
         res->success = false;
@@ -506,69 +445,47 @@ private:
         return;
       }
     } else {
-      // Choose the closest reachable position: sample a few candidates
-      // and pick the one nearest to the current EEF position.
-      // Current EEF position is approximated from the object's tracked pose.
-      double cur_x = 0.0, cur_y = 0.0;
+      // Random XY in reachable semicircle; Z = half object height (centroid on table)
+      double half_h = 0.0;
       {
         std::lock_guard<std::mutex> sl(scene_mutex_);
         auto it = tracked_objects_.find(obj_id);
         if (it != tracked_objects_.end()) {
-          cur_x = it->second.pose.pose.position.x;
-          cur_y = it->second.pose.pose.position.y;
+          half_h = objectHeight(it->second) / 2.0;
         }
       }
-
       std::mt19937 rng(std::random_device{}());
-      std::uniform_real_distribution<double> r_dist(0.15, 0.22);
+      std::uniform_real_distribution<double> r_dist(0.15, 0.25);
       std::uniform_real_distribution<double> a_dist(-1.2, 1.2);
-
-      double best_x = 0.0, best_y = 0.0, best_dist = 1e9;
-      for (int i = 0; i < 10; ++i) {
-        double r = r_dist(rng);
-        double a = a_dist(rng);
-        double cx = r * std::cos(a);
-        double cy = r * std::sin(a);
-        double d = std::hypot(cx - cur_x, cy - cur_y);
-        if (d < best_dist) {
-          best_dist = d;
-          best_x = cx;
-          best_y = cy;
-        }
-      }
-
+      double r = r_dist(rng);
+      double a = a_dist(rng);
       place_pose.header.frame_id = BASE_FRAME;
-      place_pose.pose.position.x = best_x;
-      place_pose.pose.position.y = best_y;
-      place_pose.pose.position.z = 0.0;
+      place_pose.pose.position.x = r * std::cos(a);
+      place_pose.pose.position.y = r * std::sin(a);
+      place_pose.pose.position.z = half_h;
       place_pose.pose.orientation.w = 1.0;
     }
 
     double px = place_pose.pose.position.x;
     double py = place_pose.pose.position.y;
-    // EEF target Z = half object height + small gap (3mm) above table
-    double pz = half_h + 0.003;
+    double pz = place_pose.pose.position.z;
 
-    RCLCPP_INFO(get_logger(),
-      "Place: obj='%s' px=%.3f py=%.3f pz=%.3f half_h=%.4f",
-      obj_id.c_str(), px, py, pz, half_h);
-
-    // ── Place task — mirrors pick exactly ──
-    // Pick:  CurrentState → Open → Connect → Container{ Approach↓ → GeneratePose+IK → Allow → Close → Attach → Lift↑ }
-    // Place: CurrentState →        Connect → Container{ Lower↓   → GeneratePose+IK → Open  → Forbid → Detach → Retreat↑ }
+    // Build place task
     auto pipeline = makePipeline();
     mtc::Task task;
     setupTask(task, "place_" + obj_id);
 
     // Current state
-    mtc::Stage* current_state_ptr = nullptr;
+    mtc::Stage* attach_stage_ptr = nullptr;
     {
       auto s = std::make_unique<mtc::stages::CurrentState>("current state");
-      current_state_ptr = s.get();
+      // We need to find the attach stage for GeneratePlacePose monitoring.
+      // For a place-only task, the object is already attached in current state.
+      attach_stage_ptr = s.get();
       task.add(std::move(s));
     }
 
-    // Connect — bridges current (holding object) to the place container
+    // Connect to place vicinity
     {
       auto s = std::make_unique<mtc::stages::Connect>("move to place",
         mtc::stages::Connect::GroupPlannerVector{
@@ -578,28 +495,18 @@ private:
       task.add(std::move(s));
     }
 
-    // Place container — exact mirror of pick container
+    // Place container
     {
       auto place = std::make_unique<mtc::SerialContainer>("place object");
       task.properties().exposeTo(place->properties(), {"eef", "hand", "group", "ik_frame"});
       place->properties().configureInitFrom(mtc::Stage::PARENT,
                                              {"eef", "hand", "group", "ik_frame"});
 
-      // Zero wrist roll before lowering so object is vertical at release
+      // Lower object to place position — Cartesian straight-line descent
       {
-        auto s = std::make_unique<mtc::stages::MoveTo>("zero wrist roll", joint_interp_);
-        s->setGroup(ARM_GROUP);
-        std::map<std::string, double> joints;
-        joints["joint5_roll"] = 0.0;
-        s->setGoal(joints);
-        place->insert(std::move(s));
-      }
-
-      // Lower — mirrors pick's "approach" (MoveRelative down, same solver)
-      {
-        auto s = std::make_unique<mtc::stages::MoveRelative>("lower to place", joint_interp_);
-        s->setGroup(ARM_GROUP);
-        s->setMinMaxDistance(0.005, 0.10);
+        auto s = std::make_unique<mtc::stages::MoveRelative>("lower to place", cartesian_);
+        s->properties().configureInitFrom(mtc::Stage::PARENT, {"group"});
+        s->setMinMaxDistance(0.05, 0.15);
         s->setIKFrame(HAND_FRAME);
         geometry_msgs::msg::Vector3Stamped dir;
         dir.header.frame_id = BASE_FRAME;
@@ -608,24 +515,23 @@ private:
         place->insert(std::move(s));
       }
 
-      // Place pose — same pattern as pick's GeneratePose+ComputeIK
+      // Generate place pose
       {
-        auto gen = std::make_unique<mtc::stages::GeneratePose>("generate place pose");
         geometry_msgs::msg::PoseStamped target;
         target.header.frame_id = BASE_FRAME;
         target.pose.position.x = px;
         target.pose.position.y = py;
         target.pose.position.z = pz;
-        // Zero pitch for place — the pick pitch (0.15) tilts the object
-        // relative to the EEF; placing with 0 pitch keeps the object vertical
-        {
-          double yaw = std::atan2(py, px);
-          tf2::Quaternion q;
-          q.setRPY(0.0, 0.0, yaw);
-          target.pose.orientation = tf2::toMsg(q);
-        }
+        // Object orientation: upright (identity) for placement on table.
+        // GeneratePlacePose sets the OBJECT's desired pose, not the gripper's.
+        // MTC computes the gripper pose from the grasp transform automatically.
+        target.pose.orientation = place_pose.pose.orientation;
+
+        auto gen = std::make_unique<mtc::stages::GeneratePlacePose>("generate place pose");
+        gen->properties().configureInitFrom(mtc::Stage::PARENT);
+        gen->setObject(obj_id);
         gen->setPose(target);
-        gen->setMonitoredStage(current_state_ptr);
+        gen->setMonitoredStage(attach_stage_ptr);
 
         auto ik = std::make_unique<mtc::stages::ComputeIK>("place IK", std::move(gen));
         ik->setMaxIKSolutions(20);
@@ -636,7 +542,7 @@ private:
         place->insert(std::move(ik));
       }
 
-      // Open gripper — mirrors pick's "close gripper"
+      // Open gripper
       {
         auto s = std::make_unique<mtc::stages::MoveTo>("open gripper", joint_interp_);
         s->setGroup(GRIPPER_GROUP);
@@ -644,7 +550,7 @@ private:
         place->insert(std::move(s));
       }
 
-      // Forbid collision — mirrors pick's "allow collision"
+      // Forbid collision (gripper, object) — before detach per MTC convention
       {
         auto s = std::make_unique<mtc::stages::ModifyPlanningScene>("forbid collision");
         s->allowCollisions(obj_id,
@@ -653,18 +559,18 @@ private:
         place->insert(std::move(s));
       }
 
-      // Detach object — mirrors pick's "attach object"
+      // Detach object from gripper
       {
         auto s = std::make_unique<mtc::stages::ModifyPlanningScene>("detach object");
         s->detachObject(obj_id, EEF_LINK);
         place->insert(std::move(s));
       }
 
-      // Retreat up — mirrors pick's "lift"
+      // Retreat up after placing
       {
-        auto s = std::make_unique<mtc::stages::MoveRelative>("retreat", joint_interp_);
-        s->setGroup(ARM_GROUP);
-        s->setMinMaxDistance(0.005, 0.10);
+        auto s = std::make_unique<mtc::stages::MoveRelative>("retreat", cartesian_);
+        s->properties().configureInitFrom(mtc::Stage::PARENT, {"group"});
+        s->setMinMaxDistance(0.025, 0.10);
         s->setIKFrame(HAND_FRAME);
         geometry_msgs::msg::Vector3Stamped dir;
         dir.header.frame_id = BASE_FRAME;
@@ -678,14 +584,12 @@ private:
 
     std::string err;
     if (planAndExecute(task, err)) {
+      // Update tracked pose
       {
         std::lock_guard<std::mutex> sl(scene_mutex_);
         auto it = tracked_objects_.find(obj_id);
         if (it != tracked_objects_.end()) {
-          // Update tracked pose with correct centroid Z so next pick
-          // grasps at the centroid, not the ground.
           it->second.pose = place_pose;
-          it->second.pose.pose.position.z = pz;
         }
       }
       attached_object_id_.clear();

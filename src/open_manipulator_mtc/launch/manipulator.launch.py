@@ -72,7 +72,9 @@ def generate_launch_description():
         executable="camera_tf_node.py",
         name="camera_tf_publisher",
         output="screen",
-        parameters=[{"use_sim_time": use_sim}],
+        # No use_sim_time — this node publishes a static TF and doesn't
+        # need simulation clock. Passing use_sim_time: true on real hardware
+        # (no /clock topic) causes the node to hang silently.
     )
 
     return LaunchDescription([

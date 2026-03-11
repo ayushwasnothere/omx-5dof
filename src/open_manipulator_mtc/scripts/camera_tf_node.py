@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """
 Camera TF Publisher — publishes a static transform from world to camera frame.
 
