@@ -283,6 +283,11 @@ redis-cli XADD robot.tasks '*' task_id rm-001 skill remove_objects params '{"cle
 redis-cli XADD robot.tasks '*' task_id get-001 skill get_objects params '{}'
 ```
 
+**Ping / health check:**
+```bash
+redis-cli XADD robot.tasks '*' task_id ping-001 skill ping params '{}'
+```
+
 ### Reading Events
 
 ```bash

@@ -77,6 +77,9 @@ class RedisBridge(Node):
             else:
                 raise
 
+        # Remove stale consumers from previous runs
+        self._cleanup_stale_consumers()
+
         # ── ROS2 service clients ─────────────────────────────────────────
         self._srv_clients = {
             "pick": self.create_client(Pick, "/manipulator_node/pick"),
@@ -146,6 +149,12 @@ class RedisBridge(Node):
             self.r.xack(TASK_STREAM, TASK_GROUP, msg_id)
             return
 
+        # Ping / health check — respond immediately, no ROS2 call
+        if skill == "ping":
+            self._emit_event(task_id, "success", {"status": "alive", "consumer": CONSUMER_NAME})
+            self.r.xack(TASK_STREAM, TASK_GROUP, msg_id)
+            return
+
         if skill not in self._srv_clients:
             self._emit_event(task_id, "error", {"reason": f"Unknown skill: {skill}"})
             self.r.xack(TASK_STREAM, TASK_GROUP, msg_id)
@@ -166,7 +175,7 @@ class RedisBridge(Node):
                 return
 
             future = client.call_async(request)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=120.0)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=500.0)
 
             if future.result() is None:
                 self._emit_event(task_id, "error", {"reason": "Service call timed out or failed"})
@@ -298,6 +307,20 @@ class RedisBridge(Node):
         ps.pose.orientation.z = float(ori.get("z", 0.0))
         ps.pose.orientation.w = float(ori.get("w", 1.0))
         return ps
+
+    def _cleanup_stale_consumers(self):
+        """Remove all other consumers from the group (stale from previous runs)."""
+        try:
+            consumers = self.r.xinfo_consumers(TASK_STREAM, TASK_GROUP)
+            for c in consumers:
+                name = c["name"]
+                if name != CONSUMER_NAME:
+                    pending = self.r.xgroup_delconsumer(TASK_STREAM, TASK_GROUP, name)
+                    self.get_logger().info(
+                        f"Removed stale consumer '{name}' ({pending} pending msgs dropped)"
+                    )
+        except redis.exceptions.ResponseError as e:
+            self.get_logger().warn(f"Could not clean stale consumers: {e}")
 
     def shutdown(self):
         self._running = False
