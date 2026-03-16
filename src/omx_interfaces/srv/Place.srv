@@ -4,6 +4,7 @@
 # If use_camera_frame is true, target_pose position is in camera frame.
 
 bool use_target_pose
+bool random
 geometry_msgs/PoseStamped target_pose
 bool use_camera_frame
 ---

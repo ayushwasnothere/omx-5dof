@@ -146,6 +146,15 @@ private:
   std::map<std::string, TrackedObject> tracked_objects_;
   std::string attached_object_id_;   // currently grasped object
 
+  // Store info about the last successful pick
+struct LastPickInfo {
+  bool valid = false;
+  std::string object_id;
+  geometry_msgs::msg::PoseStamped grasp_pose;
+};
+
+LastPickInfo last_pick_;
+
   // ── Helpers ─────────────────────────────────────────────────────────────
   // Extract height from tracked object dimensions
   //   Cylinder: dims = [height, radius]
@@ -318,6 +327,13 @@ private:
     // Grasp at the object centroid — gives maximum grip contact and keeps
     // the place height consistent (no gripper-to-center offset to manage)
     double oz = obj_pose.pose.position.z;
+
+    geometry_msgs::msg::PoseStamped grasp_pose;
+grasp_pose.header.frame_id = BASE_FRAME;
+grasp_pose.pose.position.x = ox;
+grasp_pose.pose.position.y = oy;
+grasp_pose.pose.position.z = oz;
+grasp_pose.pose.orientation = graspOrientation(ox, oy);
     RCLCPP_INFO(get_logger(), "Grasp at centroid: center_z=%.3f, obj_height=%.3f",
                 oz, obj_height);
 
@@ -325,6 +341,7 @@ private:
     auto pipeline = makePipeline();
     mtc::Task task;
     setupTask(task, "pick_" + req->object_id);
+
 
     // Current State
     mtc::Stage* current_state_ptr = nullptr;
@@ -342,11 +359,10 @@ private:
       task.add(std::move(s));
     }
 
-    // Connect to pre-grasp
+    // Connect to pre-grasp (arm only — gripper stays fully open)
     {
       auto s = std::make_unique<mtc::stages::Connect>("move to pick",
-        mtc::stages::Connect::GroupPlannerVector{
-          {ARM_GROUP, pipeline}, {GRIPPER_GROUP, joint_interp_}});
+        mtc::stages::Connect::GroupPlannerVector{{ARM_GROUP, pipeline}});
       s->setTimeout(10.0);
       s->properties().configureInitFrom(mtc::Stage::PARENT);
       task.add(std::move(s));
@@ -385,12 +401,6 @@ private:
       // Grasp pose
       {
         auto gen = std::make_unique<mtc::stages::GeneratePose>("generate grasp pose");
-        geometry_msgs::msg::PoseStamped grasp_pose;
-        grasp_pose.header.frame_id = BASE_FRAME;
-        grasp_pose.pose.position.x = ox;
-        grasp_pose.pose.position.y = oy;
-        grasp_pose.pose.position.z = oz;
-        grasp_pose.pose.orientation = graspOrientation(ox, oy);
         gen->setPose(grasp_pose);
         gen->setMonitoredStage(current_state_ptr);
 
@@ -456,10 +466,16 @@ private:
 
     std::string err;
     if (planAndExecute(task, err)) {
-      attached_object_id_ = req->object_id;
-      res->success = true;
-      res->message = "Picked '" + req->object_id + "'";
-    } else {
+  attached_object_id_ = req->object_id;
+
+  // Save grasp pose for reverse placement
+  last_pick_.valid = true;
+  last_pick_.object_id = req->object_id;
+  last_pick_.grasp_pose = grasp_pose;
+
+  res->success = true;
+  res->message = "Picked '" + req->object_id + "'";
+} else {
       res->success = false;
       res->message = err;
     }
@@ -494,60 +510,86 @@ private:
 
     // Determine place pose
     geometry_msgs::msg::PoseStamped place_pose;
-    if (req->use_target_pose) {
-      place_pose = req->target_pose;
-      if (req->use_camera_frame) {
-        place_pose.header.frame_id = CAMERA_FRAME;
-      }
-      std::string tf_err;
-      if (!transformToWorld(place_pose, tf_err)) {
-        res->success = false;
-        res->message = tf_err;
-        return;
-      }
-    } else {
-      // Choose the closest reachable position: sample a few candidates
-      // and pick the one nearest to the current EEF position.
-      // Current EEF position is approximated from the object's tracked pose.
-      double cur_x = 0.0, cur_y = 0.0;
-      {
-        std::lock_guard<std::mutex> sl(scene_mutex_);
-        auto it = tracked_objects_.find(obj_id);
-        if (it != tracked_objects_.end()) {
-          cur_x = it->second.pose.pose.position.x;
-          cur_y = it->second.pose.pose.position.y;
-        }
-      }
+bool place_back_to_pick = false;
 
-      std::mt19937 rng(std::random_device{}());
-      std::uniform_real_distribution<double> r_dist(0.15, 0.22);
-      std::uniform_real_distribution<double> a_dist(-1.2, 1.2);
+if (req->use_target_pose) {
 
-      double best_x = 0.0, best_y = 0.0, best_dist = 1e9;
-      for (int i = 0; i < 10; ++i) {
-        double r = r_dist(rng);
-        double a = a_dist(rng);
-        double cx = r * std::cos(a);
-        double cy = r * std::sin(a);
-        double d = std::hypot(cx - cur_x, cy - cur_y);
-        if (d < best_dist) {
-          best_dist = d;
-          best_x = cx;
-          best_y = cy;
-        }
-      }
+  place_pose = req->target_pose;
 
-      place_pose.header.frame_id = BASE_FRAME;
-      place_pose.pose.position.x = best_x;
-      place_pose.pose.position.y = best_y;
-      place_pose.pose.position.z = 0.0;
-      place_pose.pose.orientation.w = 1.0;
+  if (req->use_camera_frame)
+    place_pose.header.frame_id = CAMERA_FRAME;
+
+  std::string tf_err;
+  if (!transformToWorld(place_pose, tf_err)) {
+    res->success = false;
+    res->message = tf_err;
+    return;
+  }
+
+} else if (!req->random) {
+
+  // PLACE BACK WHERE PICKED
+  if (!last_pick_.valid || last_pick_.object_id != obj_id) {
+    res->success = false;
+    res->message = "No saved pick pose for object.";
+    return;
+  }
+
+  place_pose = last_pick_.grasp_pose;
+  place_back_to_pick = true;
+
+} else {
+
+  // RANDOM PLACEMENT
+  double cur_x = 0.0, cur_y = 0.0;
+  {
+    std::lock_guard<std::mutex> sl(scene_mutex_);
+    auto it = tracked_objects_.find(obj_id);
+    if (it != tracked_objects_.end()) {
+      cur_x = it->second.pose.pose.position.x;
+      cur_y = it->second.pose.pose.position.y;
     }
+  }
+
+  std::mt19937 rng(std::random_device{}());
+  std::uniform_real_distribution<double> r_dist(0.15, 0.22);
+  std::uniform_real_distribution<double> a_dist(-1.2, 1.2);
+
+  double best_x = 0.0, best_y = 0.0, best_dist = 1e9;
+
+  for (int i = 0; i < 10; ++i) {
+    double r = r_dist(rng);
+    double a = a_dist(rng);
+
+    double cx = r * cos(a);
+    double cy = r * sin(a);
+
+    double d = hypot(cx - cur_x, cy - cur_y);
+
+    if (d < best_dist) {
+      best_dist = d;
+      best_x = cx;
+      best_y = cy;
+    }
+  }
+
+  place_pose.header.frame_id = BASE_FRAME;
+  place_pose.pose.position.x = best_x;
+  place_pose.pose.position.y = best_y;
+  place_pose.pose.position.z = 0.0;
+  place_pose.pose.orientation.w = 1.0;
+}
 
     double px = place_pose.pose.position.x;
     double py = place_pose.pose.position.y;
     // EEF target Z = half object height + small gap (3mm) above table
-    double pz = half_h + 0.003;
+    double pz;
+
+if (place_back_to_pick) {
+  pz = place_pose.pose.position.z;
+} else {
+  pz = half_h + 0.003;
+}
 
     RCLCPP_INFO(get_logger(),
       "Place: obj='%s' px=%.3f py=%.3f pz=%.3f half_h=%.4f",
@@ -619,10 +661,14 @@ private:
         // Zero pitch for place — the pick pitch (0.15) tilts the object
         // relative to the EEF; placing with 0 pitch keeps the object vertical
         {
-          double yaw = std::atan2(py, px);
-          tf2::Quaternion q;
-          q.setRPY(0.0, 0.0, yaw);
-          target.pose.orientation = tf2::toMsg(q);
+          if (place_back_to_pick) {
+  target.pose.orientation = place_pose.pose.orientation;
+} else {
+  double yaw = std::atan2(py, px);
+  tf2::Quaternion q;
+  q.setRPY(0.0, 0.0, yaw);
+  target.pose.orientation = tf2::toMsg(q);
+}
         }
         gen->setPose(target);
         gen->setMonitoredStage(current_state_ptr);
@@ -712,8 +758,19 @@ private:
       return;
     }
 
-    // Look up target object position
+    // Look up held object height
+    double held_height = 0.0;
+    {
+      std::lock_guard<std::mutex> sl(scene_mutex_);
+      auto it = tracked_objects_.find(attached_object_id_);
+      if (it != tracked_objects_.end()) {
+        held_height = objectHeight(it->second);
+      }
+    }
+
+    // Look up target object position and height
     geometry_msgs::msg::PoseStamped target_pose;
+    double target_height = 0.0;
     {
       std::lock_guard<std::mutex> sl(scene_mutex_);
       auto it = tracked_objects_.find(req->target_object_id);
@@ -723,64 +780,97 @@ private:
         return;
       }
       target_pose = it->second.pose;
+      target_height = objectHeight(it->second);
     }
 
     double tx = target_pose.pose.position.x;
     double ty = target_pose.pose.position.y;
     double tz = target_pose.pose.position.z;
-
     double pour_angle = (req->pour_angle > 0.01) ? req->pour_angle : 2.0;
 
-    // Build pour task: move above target → tilt wrist → untilt
+    // Compute pour position:
+    //   target top  = tz + target_height / 2
+    //   held tip    = eef_z - held_height / 2   (bottom of held object)
+    //   want: held tip = target top + 0.05      (5 cm gap)
+    //   => eef_z = target top + 0.05 + held_height / 2
+    double target_top_z = tz + target_height / 2.0;
+    double pour_z = target_top_z + 0.05 + held_height / 2.0;
+
+    RCLCPP_INFO(get_logger(),
+      "Pour: held_h=%.3f target_top=%.3f pour_z=%.3f",
+      held_height, target_top_z, pour_z);
+
+    // Build pour task
     auto pipeline = makePipeline();
     mtc::Task task;
     setupTask(task, "pour");
 
     // Current state
+    mtc::Stage* current_state_ptr = nullptr;
     {
       auto s = std::make_unique<mtc::stages::CurrentState>("current state");
+      current_state_ptr = s.get();
       task.add(std::move(s));
     }
 
-    // Move above target using joint-space goal (more reliable for 5-DOF arm)
+    // Connect — bridges current state to the pour container
     {
-      auto s = std::make_unique<mtc::stages::MoveTo>("move above target", pipeline);
-      s->setGroup(ARM_GROUP);
-
-      // Compute base yaw to point at target, keep arm raised
-      double yaw = std::atan2(ty, tx);
-      std::map<std::string, double> joint_goals;
-      joint_goals["joint1"] = yaw;
-      joint_goals["joint2"] = -0.8;   // raised posture
-      joint_goals["joint3"] = 0.3;
-      joint_goals["joint4"] = 0.5;    // angled down slightly
-      joint_goals["joint5_roll"] = 0.0;
-      s->setGoal(joint_goals);
+      auto s = std::make_unique<mtc::stages::Connect>("move to pour",
+        mtc::stages::Connect::GroupPlannerVector{{ARM_GROUP, pipeline}});
+      s->setTimeout(10.0);
+      s->properties().configureInitFrom(mtc::Stage::PARENT);
       task.add(std::move(s));
     }
 
-    // Tilt wrist to pour (rotate joint5_roll)
+    // Pour container
     {
-      auto s = std::make_unique<mtc::stages::MoveRelative>("pour tilt", joint_interp_);
-      s->setGroup(ARM_GROUP);
+      auto pour = std::make_unique<mtc::SerialContainer>("pour sequence");
+      task.properties().exposeTo(pour->properties(), {"eef", "hand", "group", "ik_frame"});
+      pour->properties().configureInitFrom(mtc::Stage::PARENT,
+                                            {"eef", "hand", "group", "ik_frame"});
 
-      std::map<std::string, double> joint_deltas;
-      joint_deltas["joint5_roll"] = pour_angle;
-      s->setDirection(joint_deltas);
-      task.add(std::move(s));
-    }
+      // Pour pose — EEF directly above target, held object tip 5 cm above target top
+      {
+        auto gen = std::make_unique<mtc::stages::GeneratePose>("generate pour pose");
+        geometry_msgs::msg::PoseStamped pour_pose;
+        pour_pose.header.frame_id = BASE_FRAME;
+        pour_pose.pose.position.x = tx;
+        pour_pose.pose.position.y = ty;
+        pour_pose.pose.position.z = pour_z;
+        pour_pose.pose.orientation = graspOrientation(tx, ty);
+        gen->setPose(pour_pose);
+        gen->setMonitoredStage(current_state_ptr);
 
-    // Hold briefly (no-op, execution delay is natural)
+        auto ik = std::make_unique<mtc::stages::ComputeIK>("pour IK", std::move(gen));
+        ik->setMaxIKSolutions(20);
+        ik->setTimeout(0.5);
+        ik->setIKFrame(HAND_FRAME);
+        ik->properties().configureInitFrom(mtc::Stage::PARENT, {"eef", "group"});
+        ik->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_pose"});
+        pour->insert(std::move(ik));
+      }
 
-    // Untilt wrist
-    {
-      auto s = std::make_unique<mtc::stages::MoveRelative>("pour untilt", joint_interp_);
-      s->setGroup(ARM_GROUP);
+      // Tilt wrist to pour
+      {
+        auto s = std::make_unique<mtc::stages::MoveRelative>("pour tilt", joint_interp_);
+        s->setGroup(ARM_GROUP);
+        std::map<std::string, double> joint_deltas;
+        joint_deltas["joint5_roll"] = pour_angle;
+        s->setDirection(joint_deltas);
+        pour->insert(std::move(s));
+      }
 
-      std::map<std::string, double> joint_deltas;
-      joint_deltas["joint5_roll"] = -pour_angle;
-      s->setDirection(joint_deltas);
-      task.add(std::move(s));
+      // Untilt wrist
+      {
+        auto s = std::make_unique<mtc::stages::MoveRelative>("pour untilt", joint_interp_);
+        s->setGroup(ARM_GROUP);
+        std::map<std::string, double> joint_deltas;
+        joint_deltas["joint5_roll"] = -pour_angle;
+        s->setDirection(joint_deltas);
+        pour->insert(std::move(s));
+      }
+
+      task.add(std::move(pour));
     }
 
     std::string err;
