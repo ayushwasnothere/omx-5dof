@@ -217,6 +217,8 @@ class RedisBridge(Node):
     def _build_place(self, params: dict) -> Place.Request:
         req = Place.Request()
         req.use_target_pose = params.get("use_target_pose", False)
+        req.random = params.get("random", False)
+        req.semicircle = params.get("semicircle", True)
         req.use_camera_frame = params.get("use_camera_frame", False)
         if req.use_target_pose and "target_pose" in params:
             req.target_pose = self._make_pose_stamped(params["target_pose"])

@@ -66,14 +66,11 @@ Add multiple objects at once:
 ros2 service call /manipulator_node/add_objects omx_interfaces/srv/AddObjects \
   "{objects: [
     {id: 'cup1', type: 'cylinder',
-     pose: {header: {frame_id: 'world'}, pose: {position: {x: 0.20, y: 0.0, z: 0.04}, orientation: {w: 1.0}}},
-     dimensions: [0.15, 0.015]},
+     pose: {header: {frame_id: 'world'}, pose: {position: {x: 0.35, y: 0.15, z: 0.04}, orientation: {w: 1.0}}},
+     dimensions: [0.2, 0.015]},
     {id: 'bowl1', type: 'cylinder',
-     pose: {header: {frame_id: 'world'}, pose: {position: {x: 0.15, y: 0.15, z: 0.03}, orientation: {w: 1.0}}},
-     dimensions: [0.06, 0.025]},
-    {id: 'box1', type: 'box',
-     pose: {header: {frame_id: 'world'}, pose: {position: {x: 0.18, y: -0.10, z: 0.015}, orientation: {w: 1.0}}},
-     dimensions: [0.03, 0.03, 0.03]}
+     pose: {header: {frame_id: 'world'}, pose: {position: {x: 0.3, y: -0.15, z: 0.03}, orientation: {w: 1.0}}},
+     dimensions: [0.06, 0.025]}
   ]}"
 ```
 

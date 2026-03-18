@@ -1,10 +1,13 @@
 # Place the currently held object.
 # If use_target_pose is true, place at the given pose.
 # Otherwise, place at a random reachable position.
+# If random is true and semicircle is true, use restricted semicircle random.
+# If random is true and semicircle is false, use legacy unconstrained random.
 # If use_camera_frame is true, target_pose position is in camera frame.
 
 bool use_target_pose
 bool random
+bool semicircle true
 geometry_msgs/PoseStamped target_pose
 bool use_camera_frame
 ---
