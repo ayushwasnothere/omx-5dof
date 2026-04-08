@@ -52,7 +52,8 @@ static const std::string CAMERA_FRAME  = "camera_color_optical_frame";
 static const std::string GRIPPER_OPEN  = "open";
 static const std::string GRIPPER_CLOSE = "close";
 static const std::string ARM_HOME      = "home";
-static constexpr double PLACE_BASE_CLEARANCE = 0.015;
+static const std::string GROUND_ID     = "__ground_plane__";
+static constexpr double PLACE_BASE_CLEARANCE = 0.005;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ManipulatorNode
@@ -66,6 +67,7 @@ public:
     // Fine Cartesian steps for smooth pour arc
     cartesian_ = std::make_shared<mtc::solvers::CartesianPath>();
     cartesian_->setStepSize(0.005);
+    cartesian_->setProperty("min_fraction", 0.01);
     cartesian_->setMaxVelocityScalingFactor(0.02);
     cartesian_->setMaxAccelerationScalingFactor(0.02);
 
@@ -112,6 +114,7 @@ public:
 
     tf_buffer_   = std::make_shared<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+    addGroundPlane();
     RCLCPP_INFO(get_logger(), "ManipulatorNode ready.");
   }
 
@@ -157,6 +160,30 @@ private:
   std::mutex joint_state_mutex_;
   std::map<std::string, double> latest_arm_joints_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
+
+  void addGroundPlane()
+  {
+    moveit::planning_interface::PlanningSceneInterface psi;
+    moveit_msgs::msg::CollisionObject ground;
+    ground.id = GROUND_ID;
+    ground.header.frame_id = BASE_FRAME;
+    ground.operation = moveit_msgs::msg::CollisionObject::ADD;
+
+    shape_msgs::msg::SolidPrimitive prim;
+    prim.type = shape_msgs::msg::SolidPrimitive::BOX;
+    prim.dimensions = {2.0, 2.0, 0.01};  // 2m x 2m thin mat
+
+    geometry_msgs::msg::Pose p;
+    p.orientation.w = 1.0;
+    p.position.x = 0.0;
+    p.position.y = 0.0;
+    p.position.z = -0.025;  // lowered by 2cm (top surface at z=-0.02)
+
+    ground.primitives.push_back(prim);
+    ground.primitive_poses.push_back(p);
+    psi.applyCollisionObject(ground);
+    RCLCPP_INFO(get_logger(), "Ground plane collision object added.");
+  }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
   static double objectHeight(const TrackedObject& obj)
@@ -585,7 +612,7 @@ private:
             [](const ValidCandidate& a, const ValidCandidate& b) {
               return a.angular_dist < b.angular_dist; });
 
-          const auto& chosen = valid_candidates[valid_candidates.size() / 2];
+          const auto& chosen = valid_candidates.front();
           sc_joints_goal = chosen.joints_goal;
           semicircle_mode = true; place_back_to_pick = true;
 
@@ -775,246 +802,249 @@ private:
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  POUR — dynamic Cartesian arc pour
-  //
-  //  Geometry:
-  //    source_tip  = EEF z + src_h/2        (top rim of held source)
-  //    target_rim  = tgt centroid z + tgt_h/2
-  //    gap         = clamp(max(src_r, tgt_r)*0.8, 0.02, 0.06)
-  //
-  //  Pre-pour EEF:
-  //    XY: offset from target center by src_r along pour_yaw axis
-  //        so the source tip starts directly above the target center
-  //    Z:  EEF z = target_rim + gap - src_h/2
-  //        → source tip = EEF z + src_h/2 = target_rim + gap  ✓
-  //
-  //  Tilt arc (N Cartesian waypoints):
-  //    At tilt angle θ_i:
-  //      tip_drop(θ) = src_r * (1 - cos(θ))   ← tip descends as it swings
-  //      EEF Z       = pre_z - tip_drop(θ)     ← arm lowers to compensate
-  //      EEF roll    = θ                        ← wrist tilts source
-  //    Result: source tip stays at CONSTANT height (target_rim + gap)
-  //            while rotating toward target center — liquid arc always
-  //            lands inside the target container.
-  //
-  //  max_tilt = atan2(src_h/2, src_r) * 0.85  (85% of tip-over angle)
-  //
-  //  Motion sequence:
-  //    1. OMPL  → approach pre-pour pose (upright, above target)
-  //    2. Cartesian IK → reach pre-pour EEF pose exactly
-  //    3. Cartesian arc → tilt (coupled roll + Z descent, N waypoints)
-  //    4. Cartesian arc → untilt (reverse, coupled roll + Z ascent)
-  //    5. JointInterp  → retreat upward
-  // ═══════════════════════════════════════════════════════════════════════════
-  void pourCb(const omx_interfaces::srv::Pour::Request::SharedPtr req,
-              omx_interfaces::srv::Pour::Response::SharedPtr res)
-  {
-    std::lock_guard<std::mutex> lock(task_mutex_);
-    RCLCPP_INFO(get_logger(), "Dynamic pour into '%s'", req->target_object_id.c_str());
+//  POUR — joint-space pour for 4-DOF + wrist-roll arm
+//
+//  Hardware reality: joint5_roll is a pure spin around the forearm axis.
+//  To pour, we need the container to tip FORWARD (toward the target),
+//  which means we must orient the arm so the forearm axis is perpendicular
+//  to the pour direction BEFORE rolling.
+//
+//  Strategy:
+//    1. OMPL → move to a pre-pour joint config where:
+//         - joint1 is aimed so joint5_roll axis ⟂ pour direction
+//           (i.e., joint1 = pour_yaw + π/2, so rolling tilts the container
+//            forward/backward relative to the target, not sideways)
+//         - EEF is positioned above and behind the target
+//         - joint5_roll = 0 (container upright)
+//    2. JointInterp → sweep joint5_roll to +max_tilt  (tilt)
+//    3. JointInterp → sweep joint5_roll back to 0     (untilt)
+//    4. JointInterp → retreat upward (MoveRelative Z+)
+//
+//  Why joint1 = pour_yaw + π/2:
+//    The forearm (and joint5_roll axis) points roughly from base toward EEF.
+//    If the arm is rotated 90° from the pour direction, rolling joint5 tips
+//    the container in the pour direction.
+//    Two candidate orientations: pour_yaw + π/2 and pour_yaw - π/2.
+//    We try both and pick the one that plans successfully.
+//
+//  max_tilt = π/3 (60°) — reliable for most cylindrical containers.
+//             Clamped to π/2.2 (≈81°) as a safety ceiling.
+// ═══════════════════════════════════════════════════════════════════════════
 
-    if (attached_object_id_.empty()) {
-      res->success = false; res->message = "Not holding anything."; return;
-    }
-
-    // ── Fetch geometry ──────────────────────────────────────────────────────
-    TrackedObject src, tgt;
-    {
-      std::lock_guard<std::mutex> sl(scene_mutex_);
-      auto it1 = tracked_objects_.find(attached_object_id_);
-      auto it2 = tracked_objects_.find(req->target_object_id);
-      if (it1 == tracked_objects_.end() || it2 == tracked_objects_.end()) {
-        res->success = false; res->message = "Source/Target not found."; return;
-      }
-      src = it1->second; tgt = it2->second;
-    }
-
-    const double src_h = std::max(0.04, objectHeight(src));
-    const double src_r = std::max(0.01, objectRadius(src));
-    const double tgt_h = std::max(0.02, objectHeight(tgt));
-    const double tgt_r = std::max(0.01, objectRadius(tgt));
-
-    // ── Pour geometry ───────────────────────────────────────────────────────
-    // Gap scales with container size: large containers need more clearance
-    const double gap = std::clamp(std::max(src_r, tgt_r) * 0.8, 0.02, 0.06);
-
-    // Target rim and center
-    const double tgt_rim_z = tgt.pose.pose.position.z + tgt_h / 2.0;
-    const double tgt_cx    = tgt.pose.pose.position.x;
-    const double tgt_cy    = tgt.pose.pose.position.y;
-
-    // Direction from base toward target
-    const double pour_yaw = std::atan2(tgt_cy, tgt_cx);
-
-    // Pre-pour EEF position:
-    // Offset EEF back by src_r along pour axis so that when the wrist tilts
-    // by max_tilt, the source tip swings forward and lands over target center.
-    // EEF z set so source tip is exactly gap above target rim.
-    const double pour_offset = src_r + tgt_r;
-    const double pre_x = tgt_cx - pour_offset * std::cos(pour_yaw);
-    const double pre_y = tgt_cy - pour_offset * std::sin(pour_yaw);
-    const double pre_z = tgt_rim_z + gap + src_h / 2.0;
-    // Max tilt: 85% of angle to bring source fully horizontal
-    const double max_tilt = std::atan2(src_h / 2.0, src_r) * 0.85;
-
-    RCLCPP_INFO(get_logger(),
-      "Pour: src_h=%.3f src_r=%.3f tgt_h=%.3f tgt_r=%.3f "
-      "gap=%.3f pre=[%.3f,%.3f,%.3f] yaw=%.3f max_tilt=%.3f rad",
-      src_h, src_r, tgt_h, tgt_r, gap, pre_x, pre_y, pre_z, pour_yaw, max_tilt);
-
-    // ── Build Cartesian waypoints for tilt arc ──────────────────────────────
-    // Each waypoint encodes both the wrist roll (tilt) and the compensating
-    // Z descent so the source tip stays at constant height above target rim.
-    constexpr int N_STEPS = 12;
-
-    auto makeWaypoints = [&](double yaw_offset) {
-      const double yaw    = pour_yaw + yaw_offset;
-      const double off_x  = tgt_cx - src_r * std::cos(yaw);
-      const double off_y  = tgt_cy - src_r * std::sin(yaw);
-
-      std::vector<geometry_msgs::msg::PoseStamped> tilt_wps, untilt_wps;
-
-      for (int i = 0; i <= N_STEPS; ++i) {
-        const double theta    = max_tilt * static_cast<double>(i) / N_STEPS;
-        // tip_drop: how far the source tip descends as wrist rolls by theta
-        const double tip_drop = src_r * (1.0 - std::cos(theta));
-        // arm lowers by tip_drop to keep tip at constant height
-        const double wp_z     = pre_z - tip_drop;
-
-        // Orientation: pour_yaw (face target) + theta (wrist roll = tilt)
-        // RPY(roll=theta, pitch=0, yaw=pour_yaw) in world frame
-        tf2::Quaternion q; q.setRPY(theta, 0.0, yaw);
-
-        geometry_msgs::msg::PoseStamped wp;
-        wp.header.frame_id  = BASE_FRAME;
-        wp.pose.position.x  = off_x;
-        wp.pose.position.y  = off_y;
-        wp.pose.position.z  = wp_z;
-        wp.pose.orientation = tf2::toMsg(q.normalized());
-        tilt_wps.push_back(wp);
-      }
-
-      // Untilt: reverse of tilt (index N → 0)
-      for (int i = N_STEPS; i >= 0; --i)
-        untilt_wps.push_back(tilt_wps[i]);
-
-      return std::make_pair(tilt_wps, untilt_wps);
-    };
-
-    // Try a few yaw offsets for IK feasibility
-    const std::vector<double> yaw_offsets {0.0, 0.2, -0.2, 0.35, -0.35};
-    std::string last_err = "No pour candidate succeeded.";
-
-    for (double yaw_off : yaw_offsets) {
-      auto [tilt_wps, untilt_wps] = makeWaypoints(yaw_off);
-
-      // Pre-pour pose = first waypoint (upright, theta=0)
-      const geometry_msgs::msg::PoseStamped& pre_pour_pose = tilt_wps.front();
-      // Full-tilt pose = last tilt waypoint
-      const geometry_msgs::msg::PoseStamped& full_tilt_pose = tilt_wps.back();
-      // Back-upright = last untilt waypoint (same as pre-pour)
-
-      auto pipeline = makePipeline();
-      mtc::Task task;
-      setupTask(task, "pour_" + req->target_object_id);
-
-      mtc::Stage* current_state_ptr = nullptr;
-      { auto s = std::make_unique<mtc::stages::CurrentState>("current state");
-        current_state_ptr = s.get(); task.add(std::move(s)); }
-
-      // Phase 1: OMPL global move to vicinity of pre-pour pose
-      { auto s = std::make_unique<mtc::stages::Connect>("approach pre-pour",
-          mtc::stages::Connect::GroupPlannerVector{{ARM_GROUP, pipeline}});
-        s->setTimeout(10.0); s->properties().configureInitFrom(mtc::Stage::PARENT);
-        task.add(std::move(s)); }
-
-      {
-        auto pour_seq = std::make_unique<mtc::SerialContainer>("pour sequence");
-        task.properties().exposeTo(pour_seq->properties(), {"eef","hand","group","ik_frame"});
-        pour_seq->properties().configureInitFrom(mtc::Stage::PARENT,
-          {"eef","hand","group","ik_frame"});
-
-        // Phase 2: IK to reach exact pre-pour EEF pose (source upright above target)
-        {
-          auto gen = std::make_unique<mtc::stages::GeneratePose>("pre-pour pose");
-          gen->setPose(pre_pour_pose); gen->setMonitoredStage(current_state_ptr);
-          auto ik = std::make_unique<mtc::stages::ComputeIK>("pre-pour IK", std::move(gen));
-          ik->setMaxIKSolutions(20); ik->setTimeout(0.5); ik->setIKFrame(HAND_FRAME);
-          ik->properties().configureInitFrom(mtc::Stage::PARENT, {"eef","group"});
-          ik->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_pose"});
-          pour_seq->insert(std::move(ik));
-        }
-
-        // Phase 3: Cartesian tilt arc — coupled wrist roll + Z descent
-        // CartesianPath with step_size=0.005 interpolates through all
-        // intermediate poses, giving smooth human-like tilting motion.
-        // The Z descent exactly compensates the tip drop: source tip
-        // stays at constant height (target_rim + gap) throughout the arc.
-        {
-          auto s = std::make_unique<mtc::stages::MoveRelative>("tilt arc", cartesian_);
-          s->setGroup(ARM_GROUP); s->setIKFrame(HAND_FRAME);
-          // Allow generous min/max distance — Cartesian covers the arc length
-          s->setMinMaxDistance(0.001, 1.0);
-          // Direction: displacement from pre-pour to full-tilt pose
-          // CartesianPath interpolates orientation (roll) smoothly alongside position
-          geometry_msgs::msg::TwistStamped twist;
-          twist.header.frame_id = BASE_FRAME;
-          twist.twist.linear.x  = full_tilt_pose.pose.position.x - pre_pour_pose.pose.position.x;
-          twist.twist.linear.y  = full_tilt_pose.pose.position.y - pre_pour_pose.pose.position.y;
-          twist.twist.linear.z  = full_tilt_pose.pose.position.z - pre_pour_pose.pose.position.z;
-          // Angular: total roll = max_tilt around world X axis (tilt direction)
-          twist.twist.angular.x = max_tilt;
-          twist.twist.angular.y = 0.0;
-          twist.twist.angular.z = 0.0;
-          s->setDirection(twist);
-          pour_seq->insert(std::move(s));
-        }
-
-        // Phase 4: Cartesian untilt arc — reverse (roll back, Z ascent)
-        // Exact mirror of Phase 3: arm rises as wrist un-tilts.
-        // Source tip stays at constant height throughout.
-        {
-          auto s = std::make_unique<mtc::stages::MoveRelative>("untilt arc", cartesian_);
-          s->setGroup(ARM_GROUP); s->setIKFrame(HAND_FRAME);
-          s->setMinMaxDistance(0.001, 1.0);
-          geometry_msgs::msg::TwistStamped twist;
-          twist.header.frame_id = BASE_FRAME;
-          // Rise back up by the same tip_drop amount
-          twist.twist.linear.z  = src_r * (1.0 - std::cos(max_tilt));
-          twist.twist.linear.x  = 0.0;
-          twist.twist.linear.y  = 0.0;
-          twist.twist.angular.x = -max_tilt;  // roll back to 0
-          twist.twist.angular.y = 0.0;
-          twist.twist.angular.z = 0.0;
-          s->setDirection(twist);
-          pour_seq->insert(std::move(s));
-        }
-
-        task.add(std::move(pour_seq));
-      }
-
-      // Phase 5: retreat upward after pour
-      { auto s = std::make_unique<mtc::stages::MoveRelative>("retreat", joint_interp_);
-        s->setGroup(ARM_GROUP); s->setMinMaxDistance(0.05, 0.15); s->setIKFrame(HAND_FRAME);
-        geometry_msgs::msg::Vector3Stamped dir;
-        dir.header.frame_id=BASE_FRAME; dir.vector.z=1.0;
-        s->setDirection(dir); task.add(std::move(s)); }
-
-      std::string err;
-      if (planAndExecute(task, err, 8)) {
-        res->success = true;
-        res->message = "Pour completed (dynamic Cartesian arc, yaw_off=" +
-                       std::to_string(yaw_off) + ")";
-        return;
-      }
-      last_err = err;
-      RCLCPP_WARN(get_logger(), "Pour yaw_off=%.2f failed: %s", yaw_off, err.c_str());
-    }
-
+void pourCb(
+  const omx_interfaces::srv::Pour::Request::SharedPtr req,
+  omx_interfaces::srv::Pour::Response::SharedPtr res)
+{
+  std::lock_guard<std::mutex> lock(task_mutex_);
+  if (attached_object_id_.empty()) {
     res->success = false;
-    res->message = "Dynamic pour failed: " + last_err;
+    res->message = "Not holding anything.";
+    return;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
+  TrackedObject src, tgt;
+  {
+    std::lock_guard<std::mutex> sl(scene_mutex_);
+    auto it_src = tracked_objects_.find(attached_object_id_);
+    auto it_tgt = tracked_objects_.find(req->target_object_id);
+    if (it_src == tracked_objects_.end() || it_tgt == tracked_objects_.end()) {
+      res->success = false;
+      res->message = "Source/target object not found.";
+      return;
+    }
+    src = it_src->second;
+    tgt = it_tgt->second;
+  }
+
+  const double src_h = std::max(0.04, objectHeight(src));
+  const double src_r = std::max(0.01, objectRadius(src));
+  const double tgt_h = std::max(0.02, objectHeight(tgt));
+  const double tgt_r = std::max(0.01, objectRadius(tgt));
+
+  const double tgt_x = tgt.pose.pose.position.x;
+  const double tgt_y = tgt.pose.pose.position.y;
+  const double tgt_rim_z = tgt.pose.pose.position.z + 0.5 * tgt_h;
+  const double yaw = std::atan2(tgt_y, tgt_x);
+
+  const double tilt = std::clamp(std::abs(req->pour_angle), 0.35, 1.05);
+  tf2::Vector3 axis_world(-std::sin(yaw), std::cos(yaw), 0.0);
+  if (axis_world.length2() < 1e-9) axis_world = tf2::Vector3(0.0, 1.0, 0.0);
+  axis_world.normalize();
+  // Source lip offset in hand frame (assumed +Z from object center)
+  const tf2::Vector3 lip_in_hand(0.0, 0.0, 0.5 * src_h + 0.01);
+  tf2::Vector3 radial(tgt_x, tgt_y, 0.0);
+  if (radial.length2() < 1e-9) radial = tf2::Vector3(std::cos(yaw), std::sin(yaw), 0.0);
+  radial.normalize();
+
+  const double base_gap = std::clamp(std::max(src_r, tgt_r) * 0.90, 0.04, 0.08);
+  const double min_hand_clearance_z = 0.03;
+  const double ground_top_z = -0.02;  // from addGroundPlane(): center -0.025, thickness 0.01
+  const double source_floor_margin = 0.005;
+  const double source_bound_radius = std::sqrt(src_r * src_r + 0.25 * src_h * src_h);
+  const std::vector<double> standoff_scales{1.0, 1.4, 1.8};
+  const std::vector<double> gap_additions{0.0, 0.015, 0.03};
+
+  std::string last_err = "No collision-free pre-pour candidate.";
+  for (double s_scale : standoff_scales) {
+    for (double g_add : gap_additions) {
+      const double edge_offset = std::max(
+        tgt_r + s_scale * src_r,
+        tgt_r + src_r + 0.01);
+      const double lip_gap = base_gap + g_add;
+      tf2::Vector3 lip_world(
+        tgt_x - radial.x() * edge_offset,
+        tgt_y - radial.y() * edge_offset,
+        tgt_rim_z + lip_gap);
+
+      tf2::Quaternion q_pre;
+      q_pre.setRPY(0.0, 0.0, yaw);
+      q_pre.normalize();
+
+      const tf2::Matrix3x3 R_pre(q_pre);
+      tf2::Vector3 hand_pre = lip_world - (R_pre * lip_in_hand);
+
+      tf2::Quaternion q_delta;
+      q_delta.setRotation(axis_world, tilt);
+      q_delta.normalize();
+      const tf2::Quaternion q_tilt = (q_delta * q_pre).normalized();
+
+      const tf2::Matrix3x3 R_tilt(q_tilt);
+      tf2::Vector3 hand_tilt = lip_world - (R_tilt * lip_in_hand);
+
+      // Lift the full lip-locked trajectory if either endpoint is too close to ground.
+      const double min_hand_z = std::min(hand_pre.z(), hand_tilt.z());
+      if (min_hand_z < min_hand_clearance_z) {
+        const double lift = min_hand_clearance_z - min_hand_z;
+        lip_world.setZ(lip_world.z() + lift);
+        hand_pre = lip_world - (R_pre * lip_in_hand);
+        hand_tilt = lip_world - (R_tilt * lip_in_hand);
+      }
+
+      // Also enforce that the held source object stays above the ground plane.
+      // In this model, hand frame is near source center; use a conservative bounding radius.
+      const double min_center_z_required = ground_top_z + source_floor_margin + source_bound_radius;
+      const double current_min_center_z = std::min(hand_pre.z(), hand_tilt.z());
+      if (current_min_center_z < min_center_z_required) {
+        const double lift = min_center_z_required - current_min_center_z;
+        lip_world.setZ(lip_world.z() + lift);
+        hand_pre = lip_world - (R_pre * lip_in_hand);
+        hand_tilt = lip_world - (R_tilt * lip_in_hand);
+      }
+
+      geometry_msgs::msg::PoseStamped pre_pose;
+      pre_pose.header.frame_id = BASE_FRAME;
+      pre_pose.pose.position.x = hand_pre.x();
+      pre_pose.pose.position.y = hand_pre.y();
+      pre_pose.pose.position.z = hand_pre.z();
+      pre_pose.pose.orientation = tf2::toMsg(q_pre);
+
+      const double dx = hand_tilt.x() - hand_pre.x();
+      const double dy = hand_tilt.y() - hand_pre.y();
+      const double dz = hand_tilt.z() - hand_pre.z();
+      const double dlin = std::hypot(std::hypot(dx, dy), dz);
+
+      auto pipeline = makePipeline();
+      auto pour_cart = std::make_shared<mtc::solvers::CartesianPath>();
+      pour_cart->setStepSize(0.003);
+      pour_cart->setProperty("min_fraction", 0.0);
+      pour_cart->setMaxVelocityScalingFactor(0.02);
+      pour_cart->setMaxAccelerationScalingFactor(0.02);
+
+      mtc::Task task;
+      setupTask(task, "pour");
+
+      mtc::Stage* current_state_ptr = nullptr;
+      {
+        auto s = std::make_unique<mtc::stages::CurrentState>("current");
+        current_state_ptr = s.get();
+        task.add(std::move(s));
+      }
+
+      {
+        auto s = std::make_unique<mtc::stages::Connect>(
+          "approach pre-pour",
+          mtc::stages::Connect::GroupPlannerVector{{ARM_GROUP, pipeline}});
+        s->setTimeout(6.0);
+        s->properties().configureInitFrom(mtc::Stage::PARENT);
+        task.add(std::move(s));
+      }
+
+      {
+        auto gen = std::make_unique<mtc::stages::GeneratePose>("pre-pour pose");
+        gen->setPose(pre_pose);
+        gen->setMonitoredStage(current_state_ptr);
+        auto ik = std::make_unique<mtc::stages::ComputeIK>("pre-pour IK", std::move(gen));
+        ik->setMaxIKSolutions(8);
+        ik->setTimeout(0.4);
+        ik->setIKFrame(HAND_FRAME);
+        ik->properties().configureInitFrom(mtc::Stage::PARENT, {"eef","group"});
+        ik->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_pose"});
+        task.add(std::move(ik));
+      }
+
+      {
+        auto s = std::make_unique<mtc::stages::MoveRelative>("tilt with lip lock", pour_cart);
+        s->setGroup(ARM_GROUP);
+        s->setIKFrame(HAND_FRAME);
+        s->setMinMaxDistance(0.0, dlin + 0.02);
+        geometry_msgs::msg::TwistStamped twist;
+        twist.header.frame_id = BASE_FRAME;
+        twist.twist.linear.x = dx;
+        twist.twist.linear.y = dy;
+        twist.twist.linear.z = dz;
+        twist.twist.angular.x = axis_world.x() * tilt;
+        twist.twist.angular.y = axis_world.y() * tilt;
+        twist.twist.angular.z = axis_world.z() * tilt;
+        s->setDirection(twist);
+        task.add(std::move(s));
+      }
+
+      {
+        auto s = std::make_unique<mtc::stages::MoveRelative>("untilt with lip lock", pour_cart);
+        s->setGroup(ARM_GROUP);
+        s->setIKFrame(HAND_FRAME);
+        s->setMinMaxDistance(0.0, dlin + 0.02);
+        geometry_msgs::msg::TwistStamped twist;
+        twist.header.frame_id = BASE_FRAME;
+        twist.twist.linear.x = -dx;
+        twist.twist.linear.y = -dy;
+        twist.twist.linear.z = -dz;
+        twist.twist.angular.x = -axis_world.x() * tilt;
+        twist.twist.angular.y = -axis_world.y() * tilt;
+        twist.twist.angular.z = -axis_world.z() * tilt;
+        s->setDirection(twist);
+        task.add(std::move(s));
+      }
+
+      {
+        auto s = std::make_unique<mtc::stages::MoveRelative>("settle", joint_interp_);
+        s->setGroup(ARM_GROUP);
+        std::map<std::string,double> d;
+        d["joint2"] = -0.04;
+        d["joint3"] = 0.05;
+        d["joint4"] = -0.01;
+        s->setDirection(d);
+        task.add(std::move(s));
+      }
+
+      std::string err;
+      if (planAndExecute(task, err, 4)) {
+        res->success = true;
+        res->message = "Pour executed successfully (lip-locked tilt).";
+        return;
+      }
+
+      last_err = err;
+      RCLCPP_WARN(get_logger(),
+        "Pour candidate failed (standoff=%.3f gap=%.3f): %s",
+        edge_offset, lip_gap, err.c_str());
+    }
+  }
+
+  res->success = false;
+  res->message = last_err;
+}
+// ═══════════════════════════════════════════════════════════════════════════
   //  ROTATE
   // ═══════════════════════════════════════════════════════════════════════════
   void rotateCb(const omx_interfaces::srv::Rotate::Request::SharedPtr req,
@@ -1082,6 +1112,7 @@ private:
     std::lock_guard<std::mutex> sl(scene_mutex_);
     moveit::planning_interface::PlanningSceneInterface psi;
     std::vector<moveit_msgs::msg::CollisionObject> cos;
+    constexpr double BASE_PLANE_TOP_Z = 0.0;  // base-frame XY plane (z=0)
 
     for (auto obj : req->objects) {
       if (obj.use_camera_frame) obj.pose.header.frame_id = CAMERA_FRAME;
@@ -1104,11 +1135,12 @@ private:
         if (obj.type=="cylinder"&&d.size()>=1) hh=d[0]/2.0;
         else if(obj.type=="box"&&d.size()>=3) hh=d[2]/2.0;
         else if(obj.type=="sphere"&&d.size()>=1) hh=d[0];
-        if(obj.pose.pose.position.z<hh){
-          RCLCPP_WARN(get_logger(),"Clamping '%s' z %.3f→%.3f",
-            obj.id.c_str(),obj.pose.pose.position.z,hh);
-          obj.pose.pose.position.z=hh;
-        } }
+        const double old_z = obj.pose.pose.position.z;
+        obj.pose.pose.position.z = BASE_PLANE_TOP_Z + hh;
+        RCLCPP_INFO(get_logger(),
+          "Snap '%s' z %.3f→%.3f (base_top=%.3f, half_h=%.3f)",
+          obj.id.c_str(), old_z, obj.pose.pose.position.z, BASE_PLANE_TOP_Z, hh);
+      }
       co.primitive_poses.push_back(obj.pose.pose);
       cos.push_back(co);
 
@@ -1135,6 +1167,7 @@ private:
     else to_rm=std::vector<std::string>(req->object_ids.begin(),req->object_ids.end());
     std::vector<moveit_msgs::msg::CollisionObject> cos;
     for(const auto& id:to_rm){
+      if (id == GROUND_ID) continue;
       moveit_msgs::msg::CollisionObject co;
       co.id=id; co.operation=moveit_msgs::msg::CollisionObject::REMOVE;
       cos.push_back(co); tracked_objects_.erase(id);
